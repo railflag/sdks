@@ -1,0 +1,32 @@
+[project]
+name = "railflag-openfeature"
+version = "0.3.0"
+description = "Railflag OpenFeature provider for Python: local evaluation, streaming updates"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["openfeature-sdk>=0.10"]
+classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"]
+keywords = ["feature-flags", "feature-toggles", "openfeature", "openfeature-provider", "railflag"]
+
+[project.urls]
+Homepage = "https://railflag.com"
+Documentation = "https://railflag.com/openfeature"
+Source = "https://github.com/railflag/sdks/tree/main/packages/sdk-python"
+Issues = "https://github.com/railflag/sdks/issues"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "pyproject.toml"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/railflag"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

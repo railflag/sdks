@@ -1,0 +1,7 @@
+packages:
+  - packages/eval
+  - packages/schema
+  - packages/sdk-node
+  - packages/sdk-js
+onlyBuiltDependencies:
+  - esbuild
