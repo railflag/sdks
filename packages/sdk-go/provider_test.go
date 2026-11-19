@@ -54,6 +54,13 @@ type fakeRelay struct {
 	configCalls []int
 	streams     map[chan string]bool
 	exposures   []map[string]any
+	eventPosts  []eventPost
+	eventStatus int // the reply to /sdk/v1/events, default 202
+}
+
+type eventPost struct {
+	header http.Header
+	body   map[string]any
 }
 
 func newFakeRelay(t *testing.T) *fakeRelay {
@@ -92,6 +99,17 @@ func (r *fakeRelay) serve(w http.ResponseWriter, req *http.Request) {
 		r.exposures = append(r.exposures, b)
 		r.mu.Unlock()
 		w.WriteHeader(http.StatusAccepted)
+	case "/sdk/v1/events":
+		var b map[string]any
+		json.NewDecoder(req.Body).Decode(&b)
+		r.mu.Lock()
+		r.eventPosts = append(r.eventPosts, eventPost{req.Header.Clone(), b})
+		status := r.eventStatus
+		r.mu.Unlock()
+		if status == 0 {
+			status = http.StatusAccepted
+		}
+		w.WriteHeader(status)
 	case "/sdk/v1/config":
 		etag := fmt.Sprintf(`"v%v"`, version)
 		r.mu.Lock()

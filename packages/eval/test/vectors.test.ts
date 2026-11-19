@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { expect, it } from 'vitest';
-import { buildVectors } from '../vectors/build.ts';
+import { buildEventVectors, buildVectors } from '../vectors/build.ts';
 
 /**
  * The committed vectors are what other SDKs (Python) are tested against. If this fails, evaluation
@@ -9,4 +9,9 @@ import { buildVectors } from '../vectors/build.ts';
 it('evaluator still matches the cross-language vectors', () => {
   const committed = JSON.parse(readFileSync(new URL('../vectors/eval-vectors.json', import.meta.url), 'utf8'));
   expect(JSON.parse(JSON.stringify(buildVectors()))).toEqual(committed);
+});
+
+it('experiment events still match the cross-language vectors', () => {
+  const committed = JSON.parse(readFileSync(new URL('../vectors/events-vectors.json', import.meta.url), 'utf8'));
+  expect(JSON.parse(JSON.stringify(buildEventVectors()))).toEqual(committed);
 });

@@ -143,12 +143,31 @@ export const snapshotFlag = targeting.extend({
 });
 export type SnapshotFlag = z.infer<typeof snapshotFlag>;
 
+/** A track() event name: what an experiment metric counts. */
+export const eventName = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/, 'Use letters, digits, dot, dash, colon or underscore, starting with a letter or digit');
+
+/**
+ * Running experiments in an environment. Present in the snapshot (and in the browser evaluate response) only
+ * while at least one experiment runs, so SDKs send user keys only for flags in an experiment and only the
+ * events its metrics count.
+ */
+export const snapshotExperiments = z.object({
+  flags: z.array(flagKey),
+  events: z.array(eventName),
+});
+export type SnapshotExperiments = z.infer<typeof snapshotExperiments>;
+
 export const snapshot = z.object({
   env: z.string(),
   version: z.number().int(),
   generatedAt: z.string(),
   flags: z.record(z.string(), snapshotFlag),
   segments: z.record(z.string(), segmentRules),
+  experiments: snapshotExperiments.optional(),
 });
 export type Snapshot = z.infer<typeof snapshot>;
 
@@ -234,6 +253,42 @@ export const exposureKey = (envId: string, minute: Date) => `ex:${envId}:${minut
 export const exposureBody = z.object({
   counts: z.record(flagKey, z.record(z.string().regex(/^\d{1,3}$/), z.number().int().min(1).max(10_000_000))),
 });
+
+/**
+ * Experiment events from the SDKs, POST /sdk/v1/events. Unlike exposure counts these carry user keys, and
+ * only for flags with a running experiment (see snapshotExperiments). The relay hashes every key before
+ * storing it. Items are checked one by one: a bad item is dropped, the rest are kept.
+ *
+ * - An exposure is sent once per (flag, variation, user key) per SDK process, when an evaluation of a flag in
+ *   `experiments.flags` returns reason SPLIT and the context has a key. A user whose variation changes is sent again.
+ * - An event is sent for every track() call whose name is in `experiments.events` and whose context has a key.
+ *   `value` is optional; a missing value counts as 0.
+ * - `ts` is the client's clock in ms; `sentAt` is the client's clock when the batch was sent, which lets the
+ *   relay correct clock skew.
+ */
+export const MAX_EVENT_ITEMS = 1000;
+export const experimentExposureItem = z.object({
+  flag: flagKey,
+  variation: z.number().int().min(0).max(999),
+  key: z.string().min(1).max(256),
+  ts: z.number().int().positive(),
+});
+export const trackEventItem = z.object({
+  event: eventName,
+  key: z.string().min(1).max(256),
+  value: z.number().finite().min(-1e12).max(1e12).optional(),
+  ts: z.number().int().positive(),
+});
+export type ExperimentExposureItem = z.infer<typeof experimentExposureItem>;
+export type TrackEventItem = z.infer<typeof trackEventItem>;
+export const eventsBody = z.object({
+  sentAt: z.number().int().positive().optional(),
+  sdk: z.string().max(64).optional(),
+  exposures: z.array(z.unknown()).max(MAX_EVENT_ITEMS).default([]),
+  events: z.array(z.unknown()).max(MAX_EVENT_ITEMS).default([]),
+});
+/** The relay queues accepted batches here (user keys already hashed); the worker stores them. */
+export const EVENTS_QUEUE_KEY = 'xq';
 
 /**
  * Browser-user metering keys, shared by the relay (writes), the worker (copies to Postgres) and the api

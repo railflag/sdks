@@ -39,6 +39,19 @@ on, _ := client.BooleanValue(ctx, "new-checkout", false,
 - Server keys can read every rule. Keep them on the server; browsers use the JavaScript SDK with a client key.
 - Once a minute the provider sends how many times each flag returned each variation, for [Release Watch](https://railflag.com/release-watch). It sends counts only, such as `{"new-checkout": {"1": 42}}`, and never contexts or user ids. Sending runs on a background goroutine and never delays a flag check. `openfeature.Shutdown()` sends what's left. Turn it off with `DisableExposures: true`.
 
+## Experiments
+
+Start an experiment on a flag in the Railflag dashboard, then record conversions with OpenFeature's `Track`:
+
+```go
+client.Track(ctx, "purchase", openfeature.NewEvaluationContext("user-42", nil), openfeature.NewTrackingEventDetails(49.9))
+```
+
+- Exposures are sent automatically: when a flag in a running experiment puts a user in a variation by its rollout, the provider sends that user's key and variation, once per user and variation.
+- `Track` sends an event only when a running experiment counts it and the context has a targeting key (or a `key` attribute). The value, here an order total, counts as 0 when you don't give one.
+- User keys leave your process only for flags in a running experiment and events an experiment counts, and Railflag hashes them before storing them. While no experiment is running, nothing is sent.
+- Sending runs on a background goroutine every 10 seconds (`EventsInterval`) and never delays a flag check; `openfeature.Shutdown()` sends what's left. Turn it off with `DisableEvents: true`.
+
 ## Same answers as every other SDK
 
 `evaluate.go` is a port of `packages/eval`, Railflag's TypeScript evaluator. The tests run it against

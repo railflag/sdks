@@ -1,6 +1,6 @@
 {
   "name": "@railflag/sdk-js",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Railflag OpenFeature provider for browsers: remote evaluation, live updates",
   "license": "Apache-2.0",
   "repository": {
@@ -60,6 +60,7 @@
   "devDependencies": {
     "@openfeature/core": "1.9.2",
     "@openfeature/web-sdk": "1.6.2",
+    "@railflag/eval": "workspace:*",
     "tsup": "8.5.0"
   }
 }

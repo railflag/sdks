@@ -61,6 +61,11 @@ final class ConfigSource {
         return snapshot;
     }
 
+    /** The HTTP client, shared with {@link EventSender}. */
+    HttpClient client() {
+        return client;
+    }
+
     /** Whether the Server-Sent Events stream is connected. */
     boolean streaming() {
         return streaming;
@@ -312,7 +317,7 @@ final class ConfigSource {
         }
     }
 
-    private static ThreadFactory daemon(String name) {
+    static ThreadFactory daemon(String name) {
         return r -> {
             Thread t = new Thread(r, name);
             t.setDaemon(true);

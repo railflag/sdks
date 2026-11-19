@@ -110,6 +110,10 @@ class ProviderTest {
         final List<String> userAgents = new CopyOnWriteArrayList<>();
         final AtomicInteger streamConnections = new AtomicInteger();
         final Set<BlockingQueue<String>> streams = ConcurrentHashMap.newKeySet();
+        /** POST /sdk/v1/events: the parsed bodies and their Content-Type headers, in arrival order. */
+        final List<Map<String, Object>> eventPosts = new CopyOnWriteArrayList<>();
+        final List<String> eventContentTypes = new CopyOnWriteArrayList<>();
+        volatile int eventsStatus = 202;
 
         FakeRelay() throws IOException {
             server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -153,6 +157,15 @@ class ProviderTest {
                         }
                         stream(ex, version);
                         return;
+                    case "/sdk/v1/events":
+                        if (!ex.getRequestMethod().equals("POST")) {
+                            send(ex, 405, "");
+                            return;
+                        }
+                        eventContentTypes.add(ex.getRequestHeaders().getFirst("Content-Type"));
+                        eventPosts.add(parse(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+                        ex.sendResponseHeaders(eventsStatus, -1);
+                        return;
                     default:
                         send(ex, 404, "not found");
                 }
@@ -183,6 +196,11 @@ class ProviderTest {
             } finally {
                 streams.remove(q);
             }
+        }
+
+        @SuppressWarnings("unchecked")
+        private static Map<String, Object> parse(String json) {
+            return (Map<String, Object>) Json.parse(json);
         }
 
         private static String configEvent(String version) {

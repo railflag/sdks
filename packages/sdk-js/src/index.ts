@@ -1,7 +1,13 @@
 import {
   ErrorCode, OpenFeatureEventEmitter, ProviderEvents, StandardResolutionReasons,
-  type EvaluationContext, type JsonValue, type Provider, type ResolutionDetails,
+  type EvaluationContext, type JsonValue, type Provider, type ResolutionDetails, type TrackingEventDetails,
 } from '@openfeature/web-sdk';
+
+/** This package's version, sent with experiment events. The release job checks it against package.json. */
+export const VERSION = '0.3.0';
+
+/** Flags and events of the environment's running experiments, from the relay. */
+interface Experiments { flags: string[]; events: string[] }
 
 interface Evaluated {
   value: unknown;
@@ -29,11 +35,28 @@ export interface WebProviderOptions {
   sendExposures?: boolean;
   /** How often counts are sent. Default 60,000 ms. */
   exposureIntervalMs?: number;
+  /**
+   * Send experiment data: which variation this user got, for flags in a running experiment, and the
+   * `track()` events an experiment counts. This sends the context's targeting key (Railflag hashes it before
+   * storing it), and only while you run an experiment. Default true.
+   */
+  sendEvents?: boolean;
+  /** How often experiment data is sent (and always when the page is hidden). Default 10,000 ms. */
+  eventsIntervalMs?: number;
   fetch?: typeof fetch;
 }
 
 /** More distinct flags than this between two sends are not counted. */
 const MAX_EXPOSURE_FLAGS = 2000;
+/** Items per request and kind. Small, because keepalive requests sent while a page unloads are capped at 64 KB in total. */
+const EVENT_BATCH = 200;
+/** Items kept while the relay can't be reached; newer ones are dropped. */
+const MAX_EVENT_QUEUE = 2000;
+
+const keyOf = (ctx: EvaluationContext): string | undefined => {
+  const k = ctx.targetingKey ?? (ctx as { key?: unknown }).key;
+  return k === undefined || k === null || String(k) === '' ? undefined : String(k);
+};
 
 /**
  * OpenFeature provider for browsers. Sends the context to Railflag and gets values back,
@@ -59,7 +82,17 @@ export class RailflagWebProvider implements Provider {
   private exposures: Map<string, Map<number, number>> | null;
   private exposureTimer: ReturnType<typeof setInterval> | null = null;
   private exposureIntervalMs: number;
-  private onHide = () => { if (typeof document === 'undefined' || document.visibilityState === 'hidden') void this.flushExposures(); };
+  private experiments: Experiments | undefined;
+  /** (flag, variation, key) already sent, so each is sent once per page. */
+  private sentExposures = new Set<string>();
+  private eventQueue: { exposures: { flag: string; variation: number; key: string; ts: number }[]; events: { event: string; key: string; value: number; ts: number }[] } | null;
+  private eventTimer: ReturnType<typeof setInterval> | null = null;
+  private eventsIntervalMs: number;
+  private onHide = () => {
+    if (typeof document !== 'undefined' && document.visibilityState !== 'hidden') return;
+    void this.flushExposures();
+    void this.flushEvents();
+  };
 
   constructor(opts: WebProviderOptions) {
     // Checked at runtime too: JavaScript callers and unset env vars (`baseUrl: import.meta.env.X`) skip the type.
@@ -71,6 +104,40 @@ export class RailflagWebProvider implements Provider {
     for (const [k, v] of Object.entries(opts.bootstrap ?? {})) this.values[k] = { value: v, variationIndex: null, reason: StandardResolutionReasons.CACHED };
     this.exposures = opts.sendExposures === false ? null : new Map();
     this.exposureIntervalMs = opts.exposureIntervalMs ?? 60_000;
+    this.eventQueue = opts.sendEvents === false ? null : { exposures: [], events: [] };
+    this.eventsIntervalMs = opts.eventsIntervalMs ?? 10_000;
+  }
+
+  /** Sends queued experiment exposures and events. keepalive lets it finish while the page unloads. */
+  async flushEvents() {
+    const q = this.eventQueue;
+    while (q && (q.exposures.length || q.events.length)) {
+      const body = JSON.stringify({ sentAt: Date.now(), sdk: `js/${VERSION}`, exposures: q.exposures.splice(0, EVENT_BATCH), events: q.events.splice(0, EVENT_BATCH) });
+      try {
+        await this.f(`${this.opts.baseUrl}/sdk/v1/events`, {
+          method: 'POST', keepalive: true,
+          headers: { authorization: this.opts.clientKey, 'content-type': 'application/json' },
+          body,
+        });
+      } catch {
+        // Best effort, like exposure counts.
+      }
+    }
+  }
+
+  private queueEvent(kind: 'exposures' | 'events', item: never) {
+    const q = this.eventQueue;
+    if (!q || q[kind].length >= MAX_EVENT_QUEUE) return;
+    (q[kind] as unknown[]).push(item);
+  }
+
+  /** OpenFeature tracking: `client.track('purchase', { value: 49.9 })`. Sent only when a running experiment counts the event. */
+  track(eventName: string, context: EvaluationContext, details: TrackingEventDetails) {
+    if (!this.experiments?.events.includes(eventName)) return;
+    const key = keyOf(context ?? this.context);
+    if (key === undefined) return;
+    const value = typeof details?.value === 'number' && Number.isFinite(details.value) ? details.value : 0;
+    this.queueEvent('events', { event: eventName, key, value, ts: Date.now() } as never);
   }
 
   /** Sends the counts gathered since the last send. keepalive lets it finish while the page unloads. */
@@ -104,8 +171,9 @@ export class RailflagWebProvider implements Provider {
 
   async initialize(context?: EvaluationContext) {
     this.context = context ?? {};
-    if (this.exposures) {
-      this.exposureTimer = setInterval(() => void this.flushExposures(), this.exposureIntervalMs);
+    if (this.eventQueue) this.eventTimer = setInterval(() => void this.flushEvents(), this.eventsIntervalMs);
+    if (this.exposures || this.eventQueue) {
+      if (this.exposures) this.exposureTimer = setInterval(() => void this.flushExposures(), this.exposureIntervalMs);
       if (typeof addEventListener === 'function') {
         addEventListener('pagehide', this.onHide);
         addEventListener('visibilitychange', this.onHide);
@@ -131,11 +199,13 @@ export class RailflagWebProvider implements Provider {
   async onClose() {
     this.es?.close();
     if (this.exposureTimer) clearInterval(this.exposureTimer);
+    if (this.eventTimer) clearInterval(this.eventTimer);
     if (typeof removeEventListener === 'function') {
       removeEventListener('pagehide', this.onHide);
       removeEventListener('visibilitychange', this.onHide);
     }
     void this.flushExposures(); // never holds up closing
+    void this.flushEvents();
   }
 
   /**
@@ -168,10 +238,11 @@ export class RailflagWebProvider implements Provider {
         body: JSON.stringify({ context: this.context }),
       });
       if (!res.ok) throw Object.assign(new Error(`Railflag evaluate failed: ${res.status}`), { status: res.status });
-      const body = (await res.json()) as { version: number; flags: Record<string, Evaluated> };
+      const body = (await res.json()) as { version: number; flags: Record<string, Evaluated>; experiments?: Experiments };
       if (mine !== this.seq) return false;
       this.values = body.flags;
       this.version = body.version;
+      this.experiments = body.experiments;
       this.evaluated = true;
       this.lastError = null;
       return true;
@@ -192,6 +263,15 @@ export class RailflagWebProvider implements Provider {
     const actual = typeof v.value === 'object' ? 'object' : typeof v.value;
     if (actual !== type) return { value: def, reason: StandardResolutionReasons.ERROR, errorCode: ErrorCode.TYPE_MISMATCH };
     if (v.variationIndex !== null) this.countExposure(key, v.variationIndex);
+    if (this.eventQueue && v.reason === 'SPLIT' && v.variationIndex !== null && this.experiments?.flags.includes(key)) {
+      const user = keyOf(this.context);
+      const id = `${key}\u0000${v.variationIndex}\u0000${user}`;
+      if (user !== undefined && !this.sentExposures.has(id)) {
+        if (this.sentExposures.size >= 10_000) this.sentExposures.clear();
+        this.sentExposures.add(id);
+        this.queueEvent('exposures', { flag: key, variation: v.variationIndex, key: user, ts: Date.now() } as never);
+      }
+    }
     return { value: v.value as T, reason: v.reason, variant: v.variationIndex === null ? undefined : String(v.variationIndex), flagMetadata: v.flagVersion ? { flagVersion: v.flagVersion } : {} };
   }
 

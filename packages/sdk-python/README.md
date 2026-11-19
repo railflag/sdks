@@ -27,6 +27,21 @@ if client.get_boolean_value("new-checkout", False, EvaluationContext("user-42", 
 - Server keys can read every rule. Keep them on the server; browsers use the JavaScript SDK with a client key.
 - Once a minute the provider sends how many times each flag returned each variation, for [Release Watch](https://railflag.com/release-watch). It sends counts only, such as `{"new-checkout": {"1": 42}}`, and never contexts or user ids. Sending runs on a background thread and never delays a flag check. Turn it off with `send_exposures=False`.
 
+## Experiments
+
+Start an experiment on a flag in the Railflag dashboard, then record the conversions it measures:
+
+```python
+from openfeature.track import TrackingEventDetails
+
+client.track("purchase", EvaluationContext("user-42"), TrackingEventDetails(value=49.9))
+```
+
+- Exposures are sent automatically: while an experiment runs on a flag, the provider sends which variation each user was randomized into, once per user and variation. Users served by a target or a fixed rule aren't part of the experiment and aren't sent.
+- `track()` events are sent only for events a running experiment counts; a missing `value` counts as 0. With no experiment running, nothing is sent.
+- This sends user keys (the targeting key, or the `key` attribute), which Railflag hashes before storing them. Never contexts or other attributes.
+- Data goes out every 10 s (`events_interval`) on a background thread and never delays a flag check or `track()`. Turn it off with `send_events=False`.
+
 ## Same answers as every other SDK
 
 `railflag/evaluate.py` is a port of `packages/eval`. The tests run it against

@@ -20,7 +20,7 @@ import (
 )
 
 // Version is this SDK's version, sent in the User-Agent header.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // ChangeListener runs on a background goroutine after each update. prev is nil on the first load.
 type ChangeListener func(snap, prev Snapshot)

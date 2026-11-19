@@ -279,7 +279,8 @@ public final class Evaluator {
 
     // ---- evaluation -----------------------------------------------------------------------
 
-    private static String contextKeyOf(Map<?, ?> ctx) {
+    /** The key a context is bucketed and targeted by: {@code String(targetingKey ?? key)}, or null. */
+    static String contextKeyOf(Map<?, ?> ctx) {
         Object k = ctx.get("targetingKey");
         if (k == null) k = ctx.get("key");
         return k == null ? null : Js.string(k);

@@ -12,8 +12,11 @@ from openfeature.exception import ErrorCode
 from openfeature.flag_evaluation import FlagResolutionDetails, Reason
 from openfeature.provider import AbstractProvider
 from openfeature.provider.metadata import Metadata
+from openfeature.track import TrackingEventDetails
 
 from .evaluate import evaluate
+from .events import EventSender
+from .experiments import exposure_for, track_for
 from .exposures import ExposureCounter
 from .source import ConfigSource
 
@@ -73,16 +76,26 @@ class RailflagProvider(AbstractProvider):
         logger: Optional[logging.Logger] = None,
         send_exposures: bool = True,
         exposure_interval: float = 60.0,
+        send_events: bool = True,
+        events_interval: float = 10.0,
     ) -> None:
         """
         ``send_exposures`` sends evaluation counts per flag and variation once a minute, so Release Watch can
         measure rollouts. Only counts are sent: no contexts or user ids. Turn it off with ``send_exposures=False``.
+
+        ``send_events`` sends experiment data every ``events_interval`` seconds: which variation each user got,
+        for flags in a running experiment only, and the ``client.track()`` events an experiment counts. This sends
+        user keys (Railflag hashes them before storing them), and nothing while no experiment runs. Turn it off
+        with ``send_events=False``.
         """
         super().__init__()
         self.source = ConfigSource(sdk_key, base_url=base_url, stream=stream, poll_interval=poll_interval, timeout=timeout, logger=logger)
         self.source.on_change(self._changed)
         self.exposures: Optional[ExposureCounter] = (
             ExposureCounter(sdk_key, self.source.base_url, interval=exposure_interval, logger=logger) if send_exposures else None
+        )
+        self.tracking: Optional[EventSender] = (
+            EventSender(sdk_key, self.source.base_url, interval=events_interval, logger=logger) if send_events else None
         )
 
     def get_metadata(self) -> Metadata:
@@ -92,11 +105,31 @@ class RailflagProvider(AbstractProvider):
         self.source.start()
         if self.exposures:
             self.exposures.start()
+        if self.tracking:
+            self.tracking.start()
 
     def shutdown(self) -> None:
         self.source.stop()
         if self.exposures:
             self.exposures.stop()
+        if self.tracking:
+            self.tracking.stop()
+
+    def track(
+        self,
+        tracking_event_name: str,
+        evaluation_context: Optional[EvaluationContext] = None,
+        tracking_event_details: Optional[TrackingEventDetails] = None,
+    ) -> None:
+        """OpenFeature tracking: ``client.track("purchase", ctx, TrackingEventDetails(value=49.9))``.
+        Sent only while a running experiment counts the event."""
+        snap = self.source.snapshot
+        if self.tracking is None or snap is None:
+            return
+        value = tracking_event_details.value if tracking_event_details is not None else None
+        t = track_for(snap.get("experiments"), tracking_event_name, to_context(evaluation_context), value)
+        if t:
+            self.tracking.event(t)
 
     def _changed(self, snap: dict[str, Any], prev: Optional[dict[str, Any]]) -> None:
         if prev is None:
@@ -109,7 +142,8 @@ class RailflagProvider(AbstractProvider):
         snap = self.source.snapshot
         if snap is None:
             return FlagResolutionDetails(value=default, reason=Reason.ERROR, error_code=ErrorCode.PROVIDER_NOT_READY)
-        r = evaluate(snap, flag_key, to_context(ctx), expected_type=expected)
+        context = to_context(ctx)
+        r = evaluate(snap, flag_key, context, expected_type=expected)
         if r.reason == "ERROR":
             return FlagResolutionDetails(value=default, reason=Reason.ERROR, error_code=_ERRORS.get(r.error_code or "", ErrorCode.GENERAL), error_message=r.error_message)
         meta: dict[str, Union[str, int]] = {"flagVersion": r.flag_version or 0, "configVersion": snap["version"]}
@@ -117,6 +151,10 @@ class RailflagProvider(AbstractProvider):
             meta["ruleId"] = r.rule_id
         if self.exposures is not None and r.variation_index is not None:
             self.exposures.record(flag_key, r.variation_index)
+        if self.tracking is not None:
+            x = exposure_for(snap.get("experiments"), flag_key, context, r.reason, r.variation_index)
+            if x:
+                self.tracking.exposure(x)
         return FlagResolutionDetails(value=r.value, reason=r.reason, variant=str(r.variation_index), flag_metadata=meta)
 
     @staticmethod

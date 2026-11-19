@@ -22,6 +22,8 @@ public final class RailflagOptions {
     final HttpClient httpClient;
     /** The relay sends a heartbeat every 25 s, so a stream silent for this long is dead. */
     final Duration streamReadTimeout;
+    final boolean sendEvents;
+    final Duration eventsInterval;
 
     private RailflagOptions(Builder b) {
         String url = b.baseUrl == null ? "" : b.baseUrl;
@@ -39,6 +41,8 @@ public final class RailflagOptions {
         this.timeout = positive(b.timeout, Duration.ofSeconds(10));
         this.httpClient = b.httpClient;
         this.streamReadTimeout = positive(b.streamReadTimeout, Duration.ofSeconds(60));
+        this.sendEvents = b.sendEvents;
+        this.eventsInterval = positive(b.eventsInterval, Duration.ofSeconds(10));
     }
 
     private static Duration positive(Duration d, Duration fallback) {
@@ -57,6 +61,8 @@ public final class RailflagOptions {
         private Duration timeout;
         private HttpClient httpClient;
         private Duration streamReadTimeout;
+        private boolean sendEvents = true;
+        private Duration eventsInterval;
 
         private Builder() {}
 
@@ -93,6 +99,22 @@ public final class RailflagOptions {
         /** The HTTP client to use (proxies, custom TLS). Default: a new {@code HttpClient}. */
         public Builder httpClient(HttpClient httpClient) {
             this.httpClient = httpClient;
+            return this;
+        }
+
+        /**
+         * Send experiment data: which variation each user got, for flags in a running experiment, and the
+         * {@code track()} events an experiment counts. This sends user keys (Railflag hashes them before
+         * storing them), only for those flags and events, and only while an experiment runs. Default true.
+         */
+        public Builder sendEvents(boolean sendEvents) {
+            this.sendEvents = sendEvents;
+            return this;
+        }
+
+        /** How often experiment data is sent. Default 10 s. */
+        public Builder eventsInterval(Duration eventsInterval) {
+            this.eventsInterval = eventsInterval;
             return this;
         }
 

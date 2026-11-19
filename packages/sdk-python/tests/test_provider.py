@@ -51,6 +51,9 @@ class FakeRelay:
         self.config_calls: list[int] = []  # status codes served
         self.streams: list[queue.Queue[str | None]] = []
         self.exposures: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []  # bodies posted to /sdk/v1/events
+        self.event_headers: list[dict[str, str]] = []
+        self.events_status = 202
         relay = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -100,6 +103,10 @@ class FakeRelay:
                 if self.path == "/sdk/v1/exposures" and self.headers.get("Authorization") == KEY:
                     relay.exposures.append(json.loads(body))
                     return self._send(202, b'{"ok":true}')
+                if self.path == "/sdk/v1/events" and self.headers.get("Authorization") == KEY:
+                    relay.events.append(json.loads(body))
+                    relay.event_headers.append({k.lower(): v for k, v in self.headers.items()})
+                    return self._send(relay.events_status, b'{"ok":true}')
                 self._send(404, b"{}")
 
             def _send(self, code: int, body: bytes, etag: str | None = None) -> None:

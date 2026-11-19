@@ -38,22 +38,31 @@ type Options struct {
 	Logger        *slog.Logger  // default slog.Default()
 	// DisableExposures stops sending evaluation counts. By default the provider sends, once a minute, how many
 	// times each flag returned each variation, so Release Watch can measure rollouts. Counts only: no
-	// contexts or user ids leave your process.
+	// contexts or user ids (for experiment events, see DisableEvents).
 	DisableExposures bool
 	ExposureInterval time.Duration // default 1 minute
+	// DisableEvents stops sending experiment events. While an experiment runs in your environment, the provider
+	// sends which variation each user got of the experiment's flags (once per user and variation) and the Track
+	// calls the experiment counts. It sends user keys only for flags in a running experiment and only for events
+	// an experiment counts, and nothing at all when no experiment is running. Railflag hashes the keys before
+	// storing them.
+	DisableEvents  bool
+	EventsInterval time.Duration // default 10 seconds
 }
 
 // Provider is an OpenFeature provider that evaluates flags locally.
 type Provider struct {
-	source    *ConfigSource
-	events    chan of.Event
-	exposures *exposureCounter
+	source      *ConfigSource
+	events      chan of.Event
+	exposures   *exposureCounter
+	experiments *eventSender
 }
 
 var (
 	_ of.FeatureProvider = (*Provider)(nil)
 	_ of.StateHandler    = (*Provider)(nil)
 	_ of.EventHandler    = (*Provider)(nil)
+	_ of.Tracker         = (*Provider)(nil)
 )
 
 // NewProvider checks the options. The config is loaded when OpenFeature initializes the provider.
@@ -65,6 +74,9 @@ func NewProvider(o Options) (*Provider, error) {
 	p := &Provider{source: src, events: make(chan of.Event, 64)}
 	if !o.DisableExposures {
 		p.exposures = newExposureCounter(src, o.ExposureInterval)
+	}
+	if !o.DisableEvents {
+		p.experiments = newEventSender(src, o.EventsInterval)
 	}
 	src.OnChange(p.changed)
 	return p, nil
@@ -84,14 +96,20 @@ func (p *Provider) Init(of.EvaluationContext) error {
 	if p.exposures != nil {
 		p.exposures.start()
 	}
+	if p.experiments != nil {
+		p.experiments.start()
+	}
 	return nil
 }
 
-// Shutdown stops the config source and sends any evaluation counts not sent yet.
+// Shutdown stops the config source and sends any evaluation counts and experiment events not sent yet.
 func (p *Provider) Shutdown() {
 	p.source.Stop()
 	if p.exposures != nil {
 		p.exposures.shutdown()
+	}
+	if p.experiments != nil {
+		p.experiments.shutdown()
 	}
 }
 
@@ -101,6 +119,41 @@ func (p *Provider) FlushExposures() {
 	if p.exposures != nil {
 		p.exposures.flush()
 	}
+}
+
+// FlushEvents sends the experiment events queued so far. The provider does this every 10 seconds and on
+// Shutdown; call it yourself only in short-lived programs.
+func (p *Provider) FlushEvents() {
+	if p.experiments != nil {
+		p.experiments.flush()
+	}
+}
+
+// Track records a conversion for your experiments, such as a purchase, with details.Value() as its value
+// (an order total, say). It sends nothing unless a running experiment counts the event and the context has a
+// targeting key. Use it through the OpenFeature client:
+//
+//	client.Track(ctx, "purchase", openfeature.NewEvaluationContext("user-42", nil), openfeature.NewTrackingEventDetails(49.9))
+func (p *Provider) Track(_ context.Context, event string, c of.EvaluationContext, details of.TrackingEventDetails) {
+	if p.experiments == nil {
+		return
+	}
+	x := experimentsOf(p.source.Snapshot()) // nil before the first load, too
+	if x == nil {
+		return
+	}
+	if t := trackFor(x, event, toContext(flatten(c)), details.Value()); t != nil {
+		p.experiments.event(*t)
+	}
+}
+
+// flatten is what OpenFeature passes to the evaluation methods: the attributes plus targetingKey.
+func flatten(c of.EvaluationContext) of.FlattenedContext {
+	out := c.Attributes()
+	if k := c.TargetingKey(); k != "" {
+		out[of.TargetingKey] = k
+	}
+	return out
 }
 
 func (p *Provider) EventChannel() <-chan of.Event { return p.events }
@@ -140,18 +193,21 @@ var errorCodes = map[string]func(string) of.ResolutionError{
 	"PARSE_ERROR":    func(m string) of.ResolutionError { return of.NewParseErrorResolutionError(m) },
 }
 
-func (p *Provider) resolve(flag string, flatCtx of.FlattenedContext, expected string) (any, of.ProviderResolutionDetail) {
+// resolve evaluates a flag. It also returns the experiment exposure the evaluation produces, if any, which the
+// typed methods pass to expose once they return the flag's value rather than the default.
+func (p *Provider) resolve(flag string, flatCtx of.FlattenedContext, expected string) (any, of.ProviderResolutionDetail, *exposureRecord) {
 	snap := p.source.Snapshot()
 	if snap == nil {
-		return nil, errDetail(of.NewProviderNotReadyResolutionError("Railflag config not loaded yet"))
+		return nil, errDetail(of.NewProviderNotReadyResolutionError("Railflag config not loaded yet")), nil
 	}
-	r := Evaluate(snap, flag, toContext(flatCtx), expected)
+	ctx := toContext(flatCtx)
+	r := Evaluate(snap, flag, ctx, expected)
 	if r.Reason == "ERROR" {
 		mk, ok := errorCodes[r.ErrorCode]
 		if !ok {
 			mk = func(m string) of.ResolutionError { return of.NewGeneralResolutionError(m) }
 		}
-		return nil, errDetail(mk(r.ErrorMessage))
+		return nil, errDetail(mk(r.ErrorMessage)), nil
 	}
 	meta := of.FlagMetadata{"configVersion": int64(versionOf(snap))}
 	if r.FlagVersion != nil {
@@ -165,7 +221,18 @@ func (p *Provider) resolve(flag string, flatCtx of.FlattenedContext, expected st
 	if p.exposures != nil && r.VariationIndex != nil {
 		p.exposures.record(flag, *r.VariationIndex)
 	}
-	return r.Value, of.ProviderResolutionDetail{Reason: of.Reason(r.Reason), Variant: strconv.Itoa(*r.VariationIndex), FlagMetadata: meta}
+	var x *exposureRecord
+	if p.experiments != nil {
+		x = exposureFor(experimentsOf(snap), flag, ctx, r)
+	}
+	return r.Value, of.ProviderResolutionDetail{Reason: of.Reason(r.Reason), Variant: strconv.Itoa(*r.VariationIndex), FlagMetadata: meta}, x
+}
+
+// expose queues an experiment exposure (x is nil for most evaluations).
+func (p *Provider) expose(x *exposureRecord) {
+	if x != nil {
+		p.experiments.exposure(*x)
+	}
 }
 
 func errDetail(e of.ResolutionError) of.ProviderResolutionDetail {
@@ -173,31 +240,34 @@ func errDetail(e of.ResolutionError) of.ProviderResolutionDetail {
 }
 
 func (p *Provider) BooleanEvaluation(_ context.Context, flag string, def bool, c of.FlattenedContext) of.BoolResolutionDetail {
-	v, d := p.resolve(flag, c, "boolean")
+	v, d, x := p.resolve(flag, c, "boolean")
 	if d.Error() != nil {
 		return of.BoolResolutionDetail{Value: def, ProviderResolutionDetail: d}
 	}
+	p.expose(x)
 	return of.BoolResolutionDetail{Value: v.(bool), ProviderResolutionDetail: d}
 }
 
 func (p *Provider) StringEvaluation(_ context.Context, flag string, def string, c of.FlattenedContext) of.StringResolutionDetail {
-	v, d := p.resolve(flag, c, "string")
+	v, d, x := p.resolve(flag, c, "string")
 	if d.Error() != nil {
 		return of.StringResolutionDetail{Value: def, ProviderResolutionDetail: d}
 	}
+	p.expose(x)
 	return of.StringResolutionDetail{Value: v.(string), ProviderResolutionDetail: d}
 }
 
 func (p *Provider) FloatEvaluation(_ context.Context, flag string, def float64, c of.FlattenedContext) of.FloatResolutionDetail {
-	v, d := p.resolve(flag, c, "number")
+	v, d, x := p.resolve(flag, c, "number")
 	if d.Error() != nil {
 		return of.FloatResolutionDetail{Value: def, ProviderResolutionDetail: d}
 	}
+	p.expose(x)
 	return of.FloatResolutionDetail{Value: v.(float64), ProviderResolutionDetail: d}
 }
 
 func (p *Provider) IntEvaluation(_ context.Context, flag string, def int64, c of.FlattenedContext) of.IntResolutionDetail {
-	v, d := p.resolve(flag, c, "number")
+	v, d, x := p.resolve(flag, c, "number")
 	if d.Error() != nil {
 		return of.IntResolutionDetail{Value: def, ProviderResolutionDetail: d}
 	}
@@ -206,17 +276,19 @@ func (p *Provider) IntEvaluation(_ context.Context, flag string, def int64, c of
 		return of.IntResolutionDetail{Value: def, ProviderResolutionDetail: errDetail(of.NewTypeMismatchResolutionError(
 			fmt.Sprintf("Flag %s is %s, not an integer", flag, jsNumber(f))))}
 	}
+	p.expose(x)
 	return of.IntResolutionDetail{Value: int64(f), ProviderResolutionDetail: d}
 }
 
 // ObjectEvaluation returns JSON flags as map[string]any or []any, with numbers as float64.
 func (p *Provider) ObjectEvaluation(_ context.Context, flag string, def any, c of.FlattenedContext) of.InterfaceResolutionDetail {
-	v, d := p.resolve(flag, c, "json")
+	v, d, x := p.resolve(flag, c, "json")
 	if d.Error() != nil {
 		return of.InterfaceResolutionDetail{Value: def, ProviderResolutionDetail: d}
 	}
 	switch v.(type) {
 	case map[string]any, []any:
+		p.expose(x)
 		return of.InterfaceResolutionDetail{Value: v, ProviderResolutionDetail: d}
 	}
 	return of.InterfaceResolutionDetail{Value: def, ProviderResolutionDetail: errDetail(of.NewTypeMismatchResolutionError(

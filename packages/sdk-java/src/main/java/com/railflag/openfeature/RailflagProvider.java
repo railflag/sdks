@@ -8,6 +8,7 @@ import dev.openfeature.sdk.Metadata;
 import dev.openfeature.sdk.ProviderEvaluation;
 import dev.openfeature.sdk.ProviderEventDetails;
 import dev.openfeature.sdk.Reason;
+import dev.openfeature.sdk.TrackingEventDetails;
 import dev.openfeature.sdk.Value;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -29,22 +30,35 @@ import java.util.Objects;
  * Client client = api.getClient();
  * boolean on = client.getBooleanValue("new-checkout", false,
  *     new ImmutableContext("user-42", Map.of("plan", new Value("pro"))));
+ * client.track("purchase", new ImmutableContext("user-42"), new MutableTrackingEventDetails(49.9));
  * }</pre>
+ *
+ * <p>While an experiment runs, the provider sends which variation each user got for the experiment's flags,
+ * and the {@code track()} events the experiment counts ({@link RailflagOptions.Builder#sendEvents}).
  */
 public final class RailflagProvider extends EventProvider {
-    /** This SDK's version, sent in the User-Agent header. */
-    public static final String VERSION = "0.1.0";
+    /** This SDK's version, sent in the User-Agent header and with experiment events. */
+    public static final String VERSION = "0.2.0";
 
     private final ConfigSource source;
+    /** Experiment exposures and track() events; null when {@code sendEvents(false)}. */
+    private final EventSender tracking;
+    /** The exposures already sent, so each user's variation of a flag is sent once. */
+    private final Experiments.Dedupe sent = new Experiments.Dedupe(50_000);
 
     /** The config is loaded when OpenFeature initializes the provider (setProviderAndWait). */
     public RailflagProvider(RailflagOptions options) {
         this.source = new ConfigSource(Objects.requireNonNull(options, "options"));
+        this.tracking = options.sendEvents ? new EventSender(options, source.client()) : null;
         source.onChange(this::changed);
     }
 
     ConfigSource source() {
         return source;
+    }
+
+    EventSender tracking() {
+        return tracking;
     }
 
     @Override
@@ -56,13 +70,30 @@ public final class RailflagProvider extends EventProvider {
     @Override
     public void initialize(EvaluationContext evaluationContext) throws Exception {
         source.start();
+        if (tracking != null) tracking.start();
     }
 
-    /** Closes the stream and stops polling. */
+    /** Closes the stream, stops polling and sends the experiment events still queued. */
     @Override
     public void shutdown() {
         source.stop();
+        if (tracking != null) tracking.stop();
         super.shutdown();
+    }
+
+    /**
+     * OpenFeature tracking: {@code client.track("purchase", context, new MutableTrackingEventDetails(49.9))}.
+     * Sent only while a running experiment counts the event, for a context with a targeting key. A missing
+     * value counts as 0.
+     */
+    @Override
+    public void track(String eventName, EvaluationContext context, TrackingEventDetails details) {
+        if (tracking == null) return;
+        Map<?, ?> experiments = Experiments.of(source.snapshot());
+        if (experiments == null) return;
+        Number value = details == null ? null : details.getValue().orElse(null);
+        Experiments.Event e = Experiments.trackFor(experiments, eventName, toContext(context), value);
+        if (e != null) tracking.event(e);
     }
 
     private void changed(Map<String, Object> snap, Map<String, Object> prev) {
@@ -95,13 +126,18 @@ public final class RailflagProvider extends EventProvider {
     private <T> ProviderEvaluation<T> resolve(String flag, T defaultValue, EvaluationContext ctx, String expected, Converter<T> converter) {
         Map<String, Object> snap = source.snapshot();
         if (snap == null) return error(defaultValue, ErrorCode.PROVIDER_NOT_READY, "Railflag config not loaded yet");
-        EvalResult r = Evaluator.evaluate(snap, flag, toContext(ctx), expected);
+        Map<String, Object> context = toContext(ctx);
+        EvalResult r = Evaluator.evaluate(snap, flag, context, expected);
         if (r.errorCode != null) return error(defaultValue, errorCode(r.errorCode), r.errorMessage);
         T value;
         try {
             value = converter.convert(flag, r.value);
         } catch (IllegalArgumentException e) {
             return error(defaultValue, ErrorCode.TYPE_MISMATCH, e.getMessage());
+        }
+        if (tracking != null) {
+            Experiments.Exposure x = Experiments.exposureFor(Experiments.of(snap), flag, context, r);
+            if (x != null && sent.first(x)) tracking.exposure(x);
         }
         ImmutableMetadata.ImmutableMetadataBuilder meta = ImmutableMetadata.builder()
                 .addInteger("configVersion", (int) ConfigSource.versionOf(snap))
