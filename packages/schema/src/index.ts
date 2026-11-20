@@ -298,3 +298,36 @@ export const usageMonth = (now = new Date()) => now.toISOString().slice(0, 7);
 export const previousUsageMonth = (now = new Date()) => usageMonth(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1)));
 export const orgUsageKey = (orgId: string, month: string) => `bu:org:${orgId}:${month}`;
 export const envUsageKey = (envId: string, month: string) => `bu:env:${envId}:${month}`;
+
+const sourceField = z.string().trim().max(100).optional();
+/**
+ * Where a new organization came from, as railflag.com's attribution.js passes it to the signup page: the site that
+ * linked to us (ref), utm tags, the first page of the visit (land) and the page whose signup link was clicked (from).
+ */
+export const signupSource = z.object({
+  ref: sourceField, land: sourceField, from: sourceField, utm_source: sourceField, utm_medium: sourceField, utm_campaign: sourceField,
+});
+export type SignupSource = z.infer<typeof signupSource>;
+export const SIGNUP_SOURCE_KEYS = Object.keys(signupSource.shape) as Array<keyof SignupSource>;
+
+/**
+ * SDK sightings, for activation: the relay notes the first and the latest time each kind of SDK used an
+ * environment's key (hash field `<envId>|<sdk>`, value epoch ms); the worker copies them to sdk_connections.
+ */
+export const SDK_FIRST_SEEN_KEY = 'sdk:first';
+export const SDK_LAST_SEEN_KEY = 'sdk:last';
+export const SDK_KINDS = ['node', 'browser', 'python', 'go', 'java', 'other'] as const;
+export type SdkKind = (typeof SDK_KINDS)[number];
+
+/**
+ * Which SDK sent a request. The Python, Go and Java SDKs name themselves in User-Agent; the Node SDK uses Node's
+ * fetch, which sends "node"; the browser SDK uses a client key. Anything else (curl, a hand-written client) is "other".
+ */
+export function sdkKind(keyKind: 'server' | 'client', userAgent: string | undefined): SdkKind {
+  const ua = userAgent ?? '';
+  const named = /^railflag-(node|js|python|go|java)\b/.exec(ua);
+  if (named) return named[1] === 'js' ? 'browser' : (named[1] as SdkKind);
+  if (keyKind === 'client') return 'browser';
+  if (/^(node|undici)\b/.test(ua)) return 'node';
+  return 'other';
+}
